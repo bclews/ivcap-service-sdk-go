@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -26,10 +27,23 @@ const (
 	META_DATA_FOR_ARTIFACT_HEADER = "X-Meta-Data-For-Artifact" // metadata.META_DATA_FOR_ARTIFACT_HEADER
 	META_DATA_SCHEMA_HEADER       = "X-Meta-Data-Schema"       // metadata.META_DATA_SCHEMA_HEADER
 
-	ORDER_ID_ENV    = "IVCAP_ORDER_ID"
+	META_DATA_SCHEMA = "urn:schema:testing:image"
+
+	ORDER_ID_ENV = "IVCAP_ORDER_ID"
+	// The sidecar routes this API URL through http_proxy.
+	BASE_URL_ENV = "IVCAP_BASE_URL"
+	BASE_URL_DEF = "http://ivcap.local"
+	// Deprecated: The SDK uses this URL only if IVCAP_BASE_URL is empty.
 	STORAGE_URL_ENV = "IVCAP_STORAGE_URL"
+	// Deprecated: This constant exists for source compatibility.
 	STORAGE_URL_DEF = "http://localhost:8888"
-	CACHE_URL_ENV   = "IVCAP_CACHE_URL"
+	SIDECAR_URL_DEF = "http://localhost:8888"
+
+	ARTIFACT_STATUS_READY = "ready"
+
+	ARTIFACTS_PATH = "/1/artifacts"
+	ASPECTS_PATH   = "/1/aspects"
+	CACHE_URL_ENV  = "IVCAP_CACHE_URL"
 
 	READYZ = "/readyz"
 )
@@ -46,6 +60,9 @@ type ApiError struct {
 }
 
 func (e *ApiError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("IVCAP API error - %s", e.Message)
+	}
 	return fmt.Sprintf("IVCAP API error - %s (%s)", e.Message, e.Err)
 }
 
@@ -58,17 +75,19 @@ type HttpError struct {
 func (e *HttpError) Error() string {
 	if e.Response == nil {
 		return fmt.Sprintf("IVCAP: http request failed (%v) - %s", e.Request, e.Err)
+	} else if e.Err == nil {
+		return fmt.Sprintf("IVCAP: http response failed (%d)", e.Response.StatusCode)
 	} else {
 		return fmt.Sprintf("IVCAP: http response failed (%d) - %s", e.Response.StatusCode, e.Err)
 	}
 }
 
 type Environment struct {
-	localMode  bool
-	noCaching  bool
-	logger     LoggerI
-	storageURL string
-	cacheURL   string
+	localMode bool
+	noCaching bool
+	logger    LoggerI
+	baseURL   string
+	cacheURL  string
 }
 
 type LoggerI interface {
@@ -104,7 +123,7 @@ func NewEnvironment(options ...func(r *Environment)) (e *Environment) {
 		option(e)
 	}
 
-	e.storageURL = getOptional(STORAGE_URL_ENV, STORAGE_URL_DEF)
+	e.baseURL = strings.TrimRight(getBaseURL(), "/")
 
 	if !e.noCaching {
 		e.cacheURL, _ = os.LookupEnv(CACHE_URL_ENV)
@@ -129,11 +148,11 @@ func (e *Environment) waitForEnvironmentReady(
 	maxAttempts int,
 	attempt int,
 ) error {
-	endpoint := getOptional(STORAGE_URL_ENV, STORAGE_URL_DEF)
+	endpoint := SIDECAR_URL_DEF
 
 	url := endpoint + READYZ
 	e.logger.Debug("checking 'ready' at '%s'", url)
-	_, err := http.Get(url)
+	response, err := http.Get(url)
 	if err != nil {
 		if attempt > maxAttempts {
 			err := &EnvironmentNotReadyError{}
@@ -146,6 +165,7 @@ func (e *Environment) waitForEnvironmentReady(
 			return e.waitForEnvironmentReady(maxAttempts, attempt+1)
 		}
 	}
+	response.Body.Close()
 	return nil
 }
 
@@ -161,34 +181,52 @@ func (e *Environment) Publish(
 		return
 	}
 
-	url := e.storageURL + "/" + name
-	req, err := http.NewRequest("PUT", url, reader)
+	url := e.baseURL + ARTIFACTS_PATH
+	req, err := http.NewRequest("POST", url, reader)
 	if err != nil {
 		e.logger.Error("creating request failed - %s", err)
 		return
 	}
 
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set(NAME_HEADER, name)
+	// The API requires a base64-encoded name.
+	req.Header.Set(NAME_HEADER, base64.StdEncoding.EncodeToString([]byte(name)))
 	client := &http.Client{}
 	res, err := client.Do(req)
 	if err != nil {
 		e.logger.Error("client.Do failed - %v", err)
 		return &HttpError{req, res, err}
-	} else if res.StatusCode >= 300 {
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 300 {
 		e.logger.Error("save request failed - %d", res.StatusCode)
 		return &HttpError{req, res, nil}
 	}
-	defer res.Body.Close()
 
-	artifactID := res.Header.Get(ARTIFACT_ID_HEADER)
-	e.logger.Info("Successfully uploaded object as '%s'", artifactID)
+	var rec struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&rec); err != nil {
+		msg := "cannot read the artifact record in the response"
+		e.logger.Error("%s - %s", msg, err)
+		return &ApiError{msg, err}
+	}
+	artifactID := rec.ID
 	if artifactID == "" {
-		msg := fmt.Sprintf("Missing '%s' header", ARTIFACT_ID_HEADER)
+		artifactID = res.Header.Get(ARTIFACT_ID_HEADER)
+	}
+	if artifactID == "" {
+		msg := "cannot determine id of the created artifact"
 		e.logger.Error(msg)
 		return &ApiError{msg, nil}
 	}
-	e.logger.Debug("return headers from object upload - aid: %v h: %v", artifactID, res.Header)
+	if rec.Status != ARTIFACT_STATUS_READY {
+		msg := fmt.Sprintf("artifact '%s' is not complete - status is '%s'", artifactID, rec.Status)
+		e.logger.Error(msg)
+		return &ApiError{msg, nil}
+	}
+	e.logger.Info("Successfully uploaded object as '%s'", artifactID)
 
 	return e.PublishMetaForArtifact(name, artifactID, meta, url)
 }
@@ -226,41 +264,47 @@ func (e *Environment) PublishAsync(
 	return &wg
 }
 
+// PublishMetaForArtifact adds an aspect to an artifact.
 func (e *Environment) PublishMetaForArtifact(name string, artifactID string, meta interface{}, imgUrl string) (err error) {
 	if meta == nil {
 		return
 	}
 
-	jname := name + "-meta.json"
-	url := e.storageURL + "/" + jname
-	e.logger.Debug("starting to upload metadata - meta: %v url: %s", meta, url)
-	body, _ := json.Marshal(meta)
-	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(body))
+	q := url.Values{}
+	q.Set("entity", artifactID)
+	q.Set("schema", META_DATA_SCHEMA)
+	u := e.baseURL + ASPECTS_PATH + "?" + q.Encode()
+	e.logger.Debug("starting to upload metadata - meta: %v url: %s", meta, u)
+	body, err := json.Marshal(meta)
+	if err != nil {
+		return &ApiError{"cannot encode metadata", err}
+	}
+	req, err := http.NewRequest("POST", u, bytes.NewBuffer(body))
 	if err != nil {
 		e.logger.Error("creating request failed - %s", err)
 		return &HttpError{req, nil, err}
 	}
-
 	req.Header.Set("Content-Type", "application/json")
 
-	req.Header.Set(META_DATA_FOR_ARTIFACT_HEADER, artifactID)
-	req.Header.Set(META_DATA_SCHEMA_HEADER, "urn:schema:testing:image")
-	req.Header.Set(NAME_HEADER, jname)
-
 	client := &http.Client{}
-	if resp, err := client.Do(req); err == nil {
-		e.logger.Info("successfully upload metadata - status", resp.Status)
-	} else {
+	resp, err := client.Do(req)
+	if err != nil {
 		e.logger.Error("upload metadata failed - %s", err)
 		return &HttpError{req, resp, err}
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		e.logger.Error("upload metadata failed - status: %s", resp.Status)
+		return &HttpError{req, resp, nil}
+	}
+	e.logger.Info("successfully uploaded metadata - status: %s", resp.Status)
 	return
 }
 
 func (e *Environment) GetResource(url string, handler func(reader io.Reader) error) (err error) {
 	if strings.HasPrefix(url, "urn:") {
 		e.logger.Info("downloading artifact - urn: %s", url)
-		url = e.storageURL + "/" + url
+		url = e.baseURL + ARTIFACTS_PATH + "/" + url + "/blob"
 	} else {
 		e.logger.Info("downloading remote content - url: %s, caching?: %t", url, e.cacheURL != "")
 		if e.cacheURL != "" {
@@ -294,6 +338,16 @@ func (e *Environment) GetOrderID() string {
 	} else {
 		return "???"
 	}
+}
+
+func getBaseURL() string {
+	if v, ok := os.LookupEnv(BASE_URL_ENV); ok && v != "" {
+		return v
+	}
+	if v, ok := os.LookupEnv(STORAGE_URL_ENV); ok && v != "" {
+		return v
+	}
+	return BASE_URL_DEF
 }
 
 func getOptional(key string, _default string) string {

@@ -37,7 +37,7 @@ clean:
 
 run-dev:
 	env http_proxy=http://0.0.0.0:9999 \
-		IVCAP_STORAGE_URL=http://artifact.local \
+		IVCAP_BASE_URL=http://ivcap.local \
 		IVCAP_CACHE_URL=http://cache.local \
 		${ROOT_DIR}/${SERVICE} ${RUN_DEV_ARGS}
 
